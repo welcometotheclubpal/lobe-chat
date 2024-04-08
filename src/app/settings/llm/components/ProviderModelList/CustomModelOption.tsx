@@ -9,7 +9,7 @@ import { Flexbox } from 'react-layout-kit';
 import ModelIcon from '@/components/ModelIcon';
 import { ModelInfoTags } from '@/components/ModelSelect';
 import { useGlobalStore } from '@/store/global';
-import { modelConfigSelectors } from '@/store/global/slices/settings/selectors';
+import { modelConfigSelectors } from '@/store/global/selectors';
 import { GlobalLLMProviderKey } from '@/types/settings';
 
 interface CustomModelOptionProps {

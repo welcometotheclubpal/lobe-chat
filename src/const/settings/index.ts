@@ -111,6 +111,11 @@ export const DEFAULT_LLM_CONFIG: GlobalLLMConfig = {
     enabled: true,
     enabledModels: filterEnabledModels(OpenAIProvider),
   },
+  openai: {
+    apiKey: '',
+    enabled: false,
+    enabledModels: filterEnabledModels(OpenAIProvider),
+  },
   openrouter: {
     apiKey: '',
     enabled: false,
