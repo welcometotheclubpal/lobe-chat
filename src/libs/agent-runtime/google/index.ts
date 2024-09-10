@@ -1,10 +1,22 @@
-import { Content, GoogleGenerativeAI, Part } from '@google/generative-ai';
-import { GoogleGenerativeAIStream, StreamingTextResponse } from 'ai';
+import {
+  Content,
+  FunctionDeclaration,
+  FunctionDeclarationSchemaProperty,
+  FunctionDeclarationSchemaType,
+  Tool as GoogleFunctionCallTool,
+  GoogleGenerativeAI,
+  Part,
+} from '@google/generative-ai';
+import { JSONSchema7 } from 'json-schema';
+import { transform } from 'lodash-es';
+
+import { imageUrlToBase64 } from '@/utils/imageToBase64';
 
 import { LobeRuntimeAI } from '../BaseAI';
 import { AgentRuntimeErrorType, ILobeAgentRuntimeErrorType } from '../error';
 import {
   ChatCompetitionOptions,
+  ChatCompletionTool,
   ChatStreamPayload,
   OpenAIChatMessage,
   UserMessageContentPart,
@@ -12,6 +24,8 @@ import {
 import { ModelProvider } from '../types/type';
 import { AgentRuntimeError } from '../utils/createError';
 import { debugStream } from '../utils/debugStream';
+import { StreamingResponse } from '../utils/response';
+import { GoogleGenerativeAIStream, googleGenAIResultToStream } from '../utils/streams';
 import { parseDataUri } from '../utils/uriParser';
 
 enum HarmCategory {
@@ -27,20 +41,22 @@ enum HarmBlockThreshold {
 
 export class LobeGoogleAI implements LobeRuntimeAI {
   private client: GoogleGenerativeAI;
+  baseURL?: string;
 
-  constructor({ apiKey }: { apiKey?: string }) {
-    if (!apiKey) throw AgentRuntimeError.createError(AgentRuntimeErrorType.InvalidGoogleAPIKey);
+  constructor({ apiKey, baseURL }: { apiKey?: string; baseURL?: string } = {}) {
+    if (!apiKey) throw AgentRuntimeError.createError(AgentRuntimeErrorType.InvalidProviderAPIKey);
 
     this.client = new GoogleGenerativeAI(apiKey);
+    this.baseURL = baseURL;
   }
 
   async chat(payload: ChatStreamPayload, options?: ChatCompetitionOptions) {
     try {
-      const model = this.convertModel(payload.model, payload.messages);
+      const model = payload.model;
 
-      const contents = this.buildGoogleMessages(payload.messages, model);
+      const contents = await this.buildGoogleMessages(payload.messages, model);
 
-      const geminiStream = await this.client
+      const geminiStreamResult = await this.client
         .getGenerativeModel(
           {
             generationConfig: {
@@ -70,21 +86,22 @@ export class LobeGoogleAI implements LobeRuntimeAI {
               },
             ],
           },
-          { apiVersion: 'v1beta' },
+          { apiVersion: 'v1beta', baseUrl: this.baseURL },
         )
-        .generateContentStream({ contents });
+        .generateContentStream({ contents, tools: this.buildGoogleTools(payload.tools) });
 
-      // Convert the response into a friendly text-stream
-      const stream = GoogleGenerativeAIStream(geminiStream, options?.callback);
-
-      const [debug, output] = stream.tee();
+      const googleStream = googleGenAIResultToStream(geminiStreamResult);
+      const [prod, useForDebug] = googleStream.tee();
 
       if (process.env.DEBUG_GOOGLE_CHAT_COMPLETION === '1') {
-        debugStream(debug).catch(console.error);
+        debugStream(useForDebug).catch();
       }
 
+      // Convert the response into a friendly text-stream
+      const stream = GoogleGenerativeAIStream(prod, options?.callback);
+
       // Respond with the stream
-      return new StreamingTextResponse(output, { headers: options?.headers });
+      return StreamingResponse(stream, { headers: options?.headers });
     } catch (e) {
       const err = e as Error;
 
@@ -94,59 +111,81 @@ export class LobeGoogleAI implements LobeRuntimeAI {
     }
   }
 
-  private convertContentToGooglePart = (content: UserMessageContentPart): Part => {
+  private convertContentToGooglePart = async (content: UserMessageContentPart): Promise<Part> => {
     switch (content.type) {
       case 'text': {
         return { text: content.text };
       }
       case 'image_url': {
-        const { mimeType, base64 } = parseDataUri(content.image_url.url);
+        const { mimeType, base64, type } = parseDataUri(content.image_url.url);
 
-        if (!base64) {
-          throw new TypeError("Image URL doesn't contain base64 data");
+        if (type === 'base64') {
+          if (!base64) {
+            throw new TypeError("Image URL doesn't contain base64 data");
+          }
+
+          return {
+            inlineData: {
+              data: base64,
+              mimeType: mimeType || 'image/png',
+            },
+          };
         }
 
-        return {
-          inlineData: {
-            data: base64,
-            mimeType: mimeType || 'image/png',
-          },
-        };
+        if (type === 'url') {
+          const base64Image = await imageUrlToBase64(content.image_url.url);
+
+          return {
+            inlineData: {
+              data: base64Image,
+              mimeType: mimeType || 'image/png',
+            },
+          };
+        }
+
+        throw new TypeError(`currently we don't support image url: ${content.image_url.url}`);
       }
     }
   };
 
-  private convertOAIMessagesToGoogleMessage = (message: OpenAIChatMessage): Content => {
+  private convertOAIMessagesToGoogleMessage = async (
+    message: OpenAIChatMessage,
+  ): Promise<Content> => {
     const content = message.content as string | UserMessageContentPart[];
 
     return {
       parts:
         typeof content === 'string'
           ? [{ text: content }]
-          : content.map((c) => this.convertContentToGooglePart(c)),
+          : await Promise.all(content.map(async (c) => await this.convertContentToGooglePart(c))),
       role: message.role === 'assistant' ? 'model' : 'user',
     };
   };
 
   // convert messages from the Vercel AI SDK Format to the format
   // that is expected by the Google GenAI SDK
-  private buildGoogleMessages = (messages: OpenAIChatMessage[], model: string): Content[] => {
+  private buildGoogleMessages = async (
+    messages: OpenAIChatMessage[],
+    model: string,
+  ): Promise<Content[]> => {
     // if the model is gemini-1.5-pro-latest, we don't need any special handling
     if (model === 'gemini-1.5-pro-latest') {
-      return messages
+      const pools = messages
         .filter((message) => message.role !== 'function')
-        .map((msg) => this.convertOAIMessagesToGoogleMessage(msg));
+        .map(async (msg) => await this.convertOAIMessagesToGoogleMessage(msg));
+
+      return Promise.all(pools);
     }
 
     const contents: Content[] = [];
     let lastRole = 'model';
 
-    messages.forEach((message) => {
+    for (const message of messages) {
       // current to filter function message
       if (message.role === 'function') {
-        return;
+        continue;
       }
-      const googleMessage = this.convertOAIMessagesToGoogleMessage(message);
+      const googleMessage = await this.convertOAIMessagesToGoogleMessage(message);
 
       // if the last message is a model message and the current message is a model message
       // then we need to add a user message to separate them
@@ -159,7 +198,7 @@ export class LobeGoogleAI implements LobeRuntimeAI {
 
       // update the last role
       lastRole = googleMessage.role;
-    });
+    }
 
     // if the last message is a user message, then we need to add a model message to separate them
     if (lastRole === 'model') {
@@ -169,28 +208,13 @@ export class LobeGoogleAI implements LobeRuntimeAI {
     return contents;
   };
 
-  private convertModel = (model: string, messages: OpenAIChatMessage[]) => {
-    let finalModel: string = model;
-
-    if (model.includes('pro-vision')) {
-      // if message are all text message, use vision will return an error:
-      // "[400 Bad Request] Add an image to use models/gemini-pro-vision, or switch your model to a text model."
-      const noNeedVision = messages.every((m) => typeof m.content === 'string');
-
-      // so we need to downgrade to gemini-pro
-      if (noNeedVision) finalModel = 'gemini-pro';
-    }
-
-    return finalModel;
-  };
-
   private parseErrorMessage(message: string): {
     error: any;
     errorType: ILobeAgentRuntimeErrorType;
   } {
     const defaultError = {
       error: { message },
-      errorType: AgentRuntimeErrorType.GoogleBizError,
+      errorType: AgentRuntimeErrorType.ProviderBizError,
     };
 
     if (message.includes('location is not supported'))
@@ -212,16 +236,84 @@ export class LobeGoogleAI implements LobeRuntimeAI {
 
       switch (bizError.reason) {
         case 'API_KEY_INVALID': {
-          return { ...defaultError, errorType: AgentRuntimeErrorType.InvalidGoogleAPIKey };
+          return { ...defaultError, errorType: AgentRuntimeErrorType.InvalidProviderAPIKey };
         }
 
         default: {
-          return { error: json, errorType: AgentRuntimeErrorType.GoogleBizError };
+          return { error: json, errorType: AgentRuntimeErrorType.ProviderBizError };
         }
       }
     } catch {
       // 如果解析失败，则返回原始错误消息
       return defaultError;
+    }
+  }
+
+  private buildGoogleTools(
+    tools: ChatCompletionTool[] | undefined,
+  ): GoogleFunctionCallTool[] | undefined {
+    if (!tools || tools.length === 0) return;
+
+    return [
+      {
+        functionDeclarations: tools.map((tool) => this.convertToolToGoogleTool(tool)),
+      },
+    ];
+  }
+
+  private convertToolToGoogleTool = (tool: ChatCompletionTool): FunctionDeclaration => {
+    const functionDeclaration = tool.function;
+    const parameters = functionDeclaration.parameters;
+
+    return {
+      description: functionDeclaration.description,
+      name: functionDeclaration.name,
+      parameters: {
+        description: parameters?.description,
+        properties: transform(parameters?.properties, (result, value, key: string) => {
+          result[key] = this.convertSchemaObject(value as JSONSchema7);
+        }),
+        required: parameters?.required,
+        type: FunctionDeclarationSchemaType.OBJECT,
+      },
+    };
+  };
+
+  private convertSchemaObject(schema: JSONSchema7): FunctionDeclarationSchemaProperty {
+    switch (schema.type) {
+      default:
+      case 'object': {
+        return {
+          ...schema,
+          properties: Object.fromEntries(
+            Object.entries(schema.properties || {}).map(([key, value]) => [
+              key,
+              this.convertSchemaObject(value as JSONSchema7),
+            ]),
+          ),
+          type: FunctionDeclarationSchemaType.OBJECT,
+        } as any;
+      }
+
+      case 'array': {
+        return {
+          ...schema,
+          items: this.convertSchemaObject(schema.items as JSONSchema7),
+          type: FunctionDeclarationSchemaType.ARRAY,
+        } as any;
+      }
+
+      case 'string': {
+        return { ...schema, type: FunctionDeclarationSchemaType.STRING } as any;
+      }
+
+      case 'number': {
+        return { ...schema, type: FunctionDeclarationSchemaType.NUMBER } as any;
+      }
+
+      case 'boolean': {
+        return { ...schema, type: FunctionDeclarationSchemaType.BOOLEAN } as any;
+      }
     }
   }
 }
